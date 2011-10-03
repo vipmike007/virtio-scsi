@@ -1,0 +1,43 @@
+Name:		virtio_scsi
+Version:	VERSION
+Release:	RELEASE
+Summary:	virtio-scsi driver disk
+
+License:	GPL
+Source0:	%{name}.tar.gz
+
+%define kverrel %{version}-%{release}.%{_arch}
+%define moduledir /lib/modules/%{kverrel}/extra/%{name}
+%define module %{name}.ko
+%define file drivers/scsi/%{name}.ko
+%define debug_package %{nil}
+
+BuildRequires:	kernel-devel = %{version}-%{release}
+Provides:	kernel-modules = %{kverrel}
+
+%description
+This package provides a driver disc for %{name}.
+
+%prep
+%setup -q -n %{name}
+
+
+%build
+make %{?_smp_mflags} REL=%{kverrel}
+
+%install
+rm -rf $RPM_BUILD_ROOT
+mkdir -p $RPM_BUILD_ROOT/%{moduledir}
+cp %{file} $RPM_BUILD_ROOT/%{moduledir}/%{module}
+
+%clean
+rm -rf $RPM_BUILD_ROOT
+
+%files
+%defattr(-,root,root,-)
+%{moduledir}/%{module}
+
+
+
+%changelog
+

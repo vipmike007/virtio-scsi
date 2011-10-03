@@ -8,7 +8,8 @@ else
 # normal makefile
 REL ?= $(shell uname -r)
 KDIR ?= /usr/src/kernels/$(REL)
-QEMU_IMG = qemu-img
+#QEMU_IMG = qemu-img
+QEMU_IMG = ../../upstream/qemu/+build/qemu-img
 SRCS = drivers/scsi/virtio_scsi.c
 MAKEFLAGS += -r
 

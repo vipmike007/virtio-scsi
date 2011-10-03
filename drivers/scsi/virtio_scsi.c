@@ -307,6 +307,12 @@ out:
 	return ret;
 }
 
+static int virtscsi_queue(struct scsi_cmnd *sc, void (*done)(struct scsi_cmnd *))
+{
+	sc->scsi_done = done;
+	return virtscsi_queuecommand(sc->device->host, sc);
+}
+
 static int virtscsi_tmf(struct virtio_scsi *vscsi, struct virtio_scsi_cmd *cmd)
 {
 	DECLARE_COMPLETION_ONSTACK(comp);
@@ -372,12 +378,11 @@ static int virtscsi_abort(struct scsi_cmnd *sc)
 	};
 	return virtscsi_tmf(vscsi, cmd);
 }
-
 static struct scsi_host_template virtscsi_host_template = {
 	.module = THIS_MODULE,
 	.name = "Virtio SCSI HBA",
 	.proc_name = "virtio_scsi",
-	.queuecommand = virtscsi_queuecommand,
+	.queuecommand = virtscsi_queue,
 	.this_id = -1,
 	.eh_abort_handler = virtscsi_abort,
 	.eh_device_reset_handler = virtscsi_device_reset,

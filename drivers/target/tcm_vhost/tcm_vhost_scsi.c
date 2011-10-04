@@ -50,7 +50,11 @@ static void vhost_scsi_free_cmd(struct tcm_vhost_cmd *tv_cmd)
 	}
 
 	/* TODO what do wait_for_tasks and session_reinstatement do? */
+#if 0
 	transport_generic_free_cmd(se_cmd, 1, 0);
+#else
+	transport_generic_free_cmd(se_cmd, 1, 1, 0);
+#endif
 	kfree(tv_cmd);
 }
 
@@ -259,6 +263,11 @@ static int vhost_scsi_map_iov_to_sgl(struct tcm_vhost_cmd *tv_cmd,
 	}
 	return 0;
 }
+
+#if 0
+#else
+#define transport_lookup_cmd_lun(a,b) transport_get_lun_for_cmd(a,tv_cmd->tvc_cdb,b)
+#endif
 
 static void vhost_scsi_handle_vq(struct vhost_scsi *vs)
 {

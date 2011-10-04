@@ -505,6 +505,10 @@ static struct configfs_attribute *tcm_vhost_wwn_attrs[] = {
 	NULL,
 };
 
+static void tcm_vhost_new_cmd_failure(struct se_cmd *se_cmd)
+{
+}
+
 static struct target_core_fabric_ops tcm_vhost_ops = {
 	.get_fabric_name		= tcm_vhost_get_fabric_name,
 	.get_fabric_proto_ident		= tcm_vhost_get_fabric_proto_ident,
@@ -522,7 +526,12 @@ static struct target_core_fabric_ops tcm_vhost_ops = {
 	.tpg_release_fabric_acl		= tcm_vhost_release_fabric_acl,
 	.tpg_get_inst_index		= tcm_vhost_tpg_get_inst_index,
 	.new_cmd_map			= tcm_vhost_new_cmd_map,
+#if 0
 	.release_cmd			= tcm_vhost_release_cmd,
+#else
+	.release_cmd_to_pool		= tcm_vhost_release_cmd,
+	.release_cmd_direct		= tcm_vhost_release_cmd,
+#endif
 	.shutdown_session		= tcm_vhost_shutdown_session,
 	.close_session			= tcm_vhost_close_session,
 	.stop_session			= tcm_vhost_stop_session,
@@ -535,6 +544,9 @@ static struct target_core_fabric_ops tcm_vhost_ops = {
 	.set_default_node_attributes	= tcm_vhost_set_default_node_attrs,
 	.get_task_tag			= tcm_vhost_get_task_tag,
 	.get_cmd_state			= tcm_vhost_get_cmd_state,
+#if 1
+	.new_cmd_failure		= tcm_vhost_new_cmd_failure,
+#endif
 	.queue_data_in			= tcm_vhost_queue_data_in,
 	.queue_status			= tcm_vhost_queue_status,
 	.queue_tm_rsp			= tcm_vhost_queue_tm_rsp,

@@ -12,7 +12,7 @@ struct tcm_vhost_cmd {
 	/* Pointer to the SGL formatted memory from virtio-scsi */
 	struct scatterlist *tvc_sgl;
 	/* Pointer to response */
-	struct virtio_scsi_footer __user *tvc_footer;
+	struct virtio_scsi_cmd_resp __user *tvc_cmd_resp;
 	/* Pointer to vhost_scsi for our device */
 	struct vhost_scsi *tvc_vhost;
 	 /* The TCM I/O descriptor that is accessed via container_of() */

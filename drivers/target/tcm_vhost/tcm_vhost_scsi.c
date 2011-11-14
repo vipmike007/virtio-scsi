@@ -50,11 +50,7 @@ static void vhost_scsi_free_cmd(struct tcm_vhost_cmd *tv_cmd)
 	}
 
 	/* TODO what do wait_for_tasks and session_reinstatement do? */
-#if 0
 	transport_generic_free_cmd(se_cmd, 1, 0);
-#else
-	transport_generic_free_cmd(se_cmd, 1, 1, 0);
-#endif
 	kfree(tv_cmd);
 }
 
@@ -73,7 +69,7 @@ static void vhost_scsi_complete_cmd_work(struct vhost_work *work)
 	/* TODO locking? */
 	list_for_each_entry_safe(tv_cmd, tmp, &vs->vs_completion_list,
 	                         tvc_completion_list) {
-		struct virtio_scsi_footer v_footer;
+		struct virtio_scsi_cmd_resp v_cmd_resp;
 		struct se_cmd *se_cmd = &tv_cmd->tvc_se_cmd;
 		int ret;
 
@@ -82,19 +78,19 @@ static void vhost_scsi_complete_cmd_work(struct vhost_work *work)
 
 		list_del(&tv_cmd->tvc_completion_list);
 
-		memset(&v_footer, 0, sizeof(v_footer));
-		v_footer.resid = se_cmd->residual_count;
+		memset(&v_cmd_resp, 0, sizeof(v_cmd_resp));
+		v_cmd_resp.resid = se_cmd->residual_count;
 		/* TODO is status_qualifier field needed? */
-		v_footer.status = se_cmd->scsi_status;
-		v_footer.sense_len = se_cmd->scsi_sense_length;
-		memcpy(v_footer.sense, tv_cmd->tvc_sense_buf,
-		       v_footer.sense_len);
-		ret = copy_to_user(tv_cmd->tvc_footer, &v_footer,
-		                   sizeof(v_footer));
+		v_cmd_resp.status = se_cmd->scsi_status;
+		v_cmd_resp.sense_len = se_cmd->scsi_sense_length;
+		memcpy(v_cmd_resp.sense, tv_cmd->tvc_sense_buf,
+		       v_cmd_resp.sense_len);
+		ret = copy_to_user(tv_cmd->tvc_cmd_resp, &v_cmd_resp,
+		                   sizeof(v_cmd_resp));
 		if (likely(ret == 0))
 			vhost_add_used(&vs->cmd_vq, tv_cmd->tvc_vq_desc, 0);
 		else
-			pr_err("Faulted on virtio_scsi_footer\n");
+			pr_err("Faulted on virtio_scsi_cmd_resp\n");
 
 		vhost_scsi_free_cmd(tv_cmd);
 	}
@@ -117,7 +113,7 @@ void vhost_scsi_complete_cmd(struct tcm_vhost_cmd *tv_cmd)
 
 static struct tcm_vhost_cmd *vhost_scsi_allocate_cmd(
 	struct tcm_vhost_tpg *tv_tpg,
-	struct virtio_scsi_cmd_header *v_header,
+	struct virtio_scsi_cmd_req *v_cmd_req,
 	u32 exp_data_len,
 	int data_direction)
 {
@@ -141,13 +137,13 @@ static struct tcm_vhost_cmd *vhost_scsi_allocate_cmd(
 		return ERR_PTR(-ENOMEM);
 	}
 	INIT_LIST_HEAD(&tv_cmd->tvc_completion_list);
-	tv_cmd->tvc_tag = v_header->tag;
+	tv_cmd->tvc_tag = v_cmd_req->tag;
 
 	se_cmd = &tv_cmd->tvc_se_cmd;
 	/*
-	 * Locate the SAM Task Attr from virtio_scsi_cmd_header
+	 * Locate the SAM Task Attr from virtio_scsi_cmd_req
 	 */
-	sam_task_attr = v_header->task_attr;
+	sam_task_attr = v_cmd_req->task_attr;
 	/*
 	 * Initialize struct se_cmd descriptor from target_core_mod infrastructure
 	 */
@@ -264,15 +260,20 @@ static int vhost_scsi_map_iov_to_sgl(struct tcm_vhost_cmd *tv_cmd,
 	return 0;
 }
 
-#if 0
-#else
-#define transport_lookup_cmd_lun(a,b) transport_get_lun_for_cmd(a,tv_cmd->tvc_cdb,b)
-#endif
+int vhost_lookup_cmd_lun(struct se_cmd *se_cmd, u8 *vhost_lun)
+{
+	u32 unpacked_lun;
+	WARN_ON(vhost_lun[0] != 1 || vhost_lun[1] != 0);
+	WARN_ON(vhost_lun[2] > 0 && vhost_lun[2] <= 0x3F);
+	WARN_ON(vhost_lun[2] >= 0x80);
+	unpacked_lun = ((vhost_lun[2] & 0x3F) << 8) | vhost_lun[3];
+	return transport_lookup_cmd_lun(se_cmd, unpacked_lun);
+}
 
 static void vhost_scsi_handle_vq(struct vhost_scsi *vs)
 {
 	struct vhost_virtqueue *vq = &vs->cmd_vq;
-	struct virtio_scsi_cmd_header v_header;
+	struct virtio_scsi_cmd_req v_cmd_req;
 	struct tcm_vhost_tpg *tv_tpg;
 	struct tcm_vhost_cmd *tv_cmd;
 	u32 exp_data_len, data_direction;
@@ -306,11 +307,11 @@ static void vhost_scsi_handle_vq(struct vhost_scsi *vs)
 		}
 
 #warning FIXME: BIDI operation
-		if (out == 2 && in == 1) {
+		if (out == 1 && in == 1) {
 			data_direction = DMA_NONE;
-		} else if (out == 2 && in > 1) {
+		} else if (out == 1 && in > 1) {
 			data_direction = DMA_FROM_DEVICE;
-		} else if (out > 2 && in == 1) {
+		} else if (out > 1 && in == 1) {
 			data_direction = DMA_TO_DEVICE;
 		} else {
 			pr_err("Invalid buffer layout out: %u in: %u\n", out, in);
@@ -318,33 +319,37 @@ static void vhost_scsi_handle_vq(struct vhost_scsi *vs)
 		}
 
 		/*
-		 * Check for a sane footer buffer so we can report errors to
+		 * Check for a sane cmd_resp buffer so we can report errors to
 		 * the guest.
+		 *
+		 * TODO: handle variable cdb/sense buffer size.  Right now
+		 * we expect request/response headers in separate buffers.
 		 */
-		if (unlikely(vq->iov[out + in - 1].iov_len !=
-					sizeof(struct virtio_scsi_footer))) {
-			pr_err("Expecting virtio_scsi_footer, got %zu bytes\n",
-					vq->iov[out + in - 1].iov_len);
+		if (unlikely(vq->iov[out].iov_len !=
+					sizeof(struct virtio_scsi_cmd_resp))) {
+			pr_err("Expecting virtio_scsi_cmd_resp, got %zu bytes\n",
+					vq->iov[out].iov_len);
 			break;
 		}
 
-		if (unlikely(vq->iov[0].iov_len != sizeof(v_header))) {
-			pr_err("Expecting virtio_scsi_cmd_header, got %zu bytes\n",
+		if (unlikely(vq->iov[0].iov_len != sizeof(v_cmd_req))) {
+			pr_err("Expecting virtio_scsi_cmd_req, got %zu bytes\n",
 					vq->iov[0].iov_len);
 			break;
 		}
-		ret = __copy_from_user(&v_header, vq->iov[0].iov_base, sizeof(v_header));
+		ret = __copy_from_user(&v_cmd_req, vq->iov[0].iov_base, sizeof(v_cmd_req));
 		if (unlikely(ret)) {
-			pr_err("Faulted on virtio_scsi_cmd_header\n");
+			pr_err("Faulted on virtio_scsi_cmd_req\n");
 			break;
 		}
 
 		exp_data_len = 0;
-		for (i = 2; i < out + in - 1; i++) {
-			exp_data_len += vq->iov[i].iov_len;
+		for (i = 0; i < out + in - 1; i++) {
+			if (i != 0 && i != out)
+				exp_data_len += vq->iov[i].iov_len;
 		}
 
-		tv_cmd = vhost_scsi_allocate_cmd(tv_tpg, &v_header,
+		tv_cmd = vhost_scsi_allocate_cmd(tv_tpg, &v_cmd_req,
 					exp_data_len, data_direction);
 		if (IS_ERR(tv_cmd)) {
 			pr_err("vhost_scsi_allocate_cmd failed %ld\n", PTR_ERR(tv_cmd));
@@ -353,30 +358,20 @@ static void vhost_scsi_handle_vq(struct vhost_scsi *vs)
 
 		tv_cmd->tvc_vhost = vs;
 
-		if (unlikely(vq->iov[out + in - 1].iov_len !=
-		             sizeof(struct virtio_scsi_footer))) {
-			pr_err("Expecting virtio_scsi_footer, "
-			       " got %zu bytes\n", vq->iov[out + in - 1].iov_len);
+		if (unlikely(vq->iov[out].iov_len !=
+		             sizeof(struct virtio_scsi_cmd_resp))) {
+			pr_err("Expecting virtio_scsi_cmd_resp, "
+			       " got %zu bytes\n", vq->iov[out].iov_len);
 			break;
 		}
-		tv_cmd->tvc_footer = vq->iov[out + in - 1].iov_base;
+		tv_cmd->tvc_cmd_resp = vq->iov[out].iov_base;
 
-		if (unlikely(vq->iov[1].iov_len > TCM_VHOST_MAX_CDB_SIZE)) {
-			pr_err("CDB length: %zu exceeds %d\n",
-				vq->iov[1].iov_len, TCM_VHOST_MAX_CDB_SIZE);
+		if (unlikely(vq->iov[0].iov_len < offsetof(struct virtio_scsi_cmd_req, cdb))) {
+			pr_err("CDB length: %zu less than %d\n",
+				vq->iov[0].iov_len,
+				(int)offsetof(struct virtio_scsi_cmd_req, cdb));
 			/* TODO clean up and free tv_cmd */
 			break;
-		}
-		/*
-		 * Copy in the recieved CDB descriptor into tv_cmd->tvc_cdb
-		 * that will be used by tcm_vhost_new_cmd_map() and down into
-		 * transport_generic_allocate_tasks()
-		 */
-		ret = __copy_from_user(tv_cmd->tvc_cdb, vq->iov[1].iov_base,
-					vq->iov[1].iov_len);
-		if (unlikely(ret)) {
-			pr_err("Faulted on CDB\n");
-			break; /* TODO should all breaks be continues? */
 		}
 		/*
 		 * Check that the recieved CDB size does not exceeded our
@@ -391,13 +386,21 @@ static void vhost_scsi_handle_vq(struct vhost_scsi *vs)
 		}
 
 		printk("vhost_scsi got command opcode: %#02x, lun: %#llx\n",
-			tv_cmd->tvc_cdb[0], v_header.lun);
+			tv_cmd->tvc_cdb[0], *(u64 *)v_cmd_req.lun);
 
-		if (data_direction != DMA_NONE) {
-			ret = vhost_scsi_map_iov_to_sgl(tv_cmd, &vq->iov[2],
-					out + in - 3, data_direction == DMA_TO_DEVICE);
+		if (out > 1) {
+			ret = vhost_scsi_map_iov_to_sgl(tv_cmd, &vq->iov[1],
+					out - 1, false);
 			if (unlikely(ret)) {
-				pr_err("Failed to map iov to sgl\n");
+				pr_err("Failed to map out iov to sgl\n");
+				break; /* TODO */
+			}
+		}
+		if (in > 1) {
+			ret = vhost_scsi_map_iov_to_sgl(tv_cmd, &vq->iov[out+1],
+					in - 1, true);
+			if (unlikely(ret)) {
+				pr_err("Failed to map in iov to sgl\n");
 				break; /* TODO */
 			}
 		}
@@ -409,13 +412,13 @@ static void vhost_scsi_handle_vq(struct vhost_scsi *vs)
 		 */
 		tv_cmd->tvc_vq_desc = head;
 		/*
-		 * Locate the struct se_lun pointer based on v_header->lun, and
+		 * Locate the struct se_lun pointer based on v_cmd_req->lun, and
 		 * attach it to struct se_cmd
 		 *
-		 * Note this currently assumes v_header->lun has already been unpacked.
+		 * Note this currently assumes v_cmd_req->lun has already been unpacked.
 		 */
-		if (transport_lookup_cmd_lun(&tv_cmd->tvc_se_cmd, v_header.lun) < 0) {
-			pr_err("Failed to look up lun: %#08llx\n", v_header.lun);
+		if (vhost_lookup_cmd_lun(&tv_cmd->tvc_se_cmd, v_cmd_req.lun) < 0) {
+			pr_err("Failed to look up lun: %#08llx\n", *(u64 *)v_cmd_req.lun);
 			/* NON_EXISTENT_LUN */
 			transport_send_check_condition_and_sense(&tv_cmd->tvc_se_cmd,
 					tv_cmd->tvc_se_cmd.scsi_sense_reason, 0);

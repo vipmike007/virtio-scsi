@@ -1,5 +1,6 @@
 ifneq ($(LINUXINCLUDE),)
 # kbuild part of makefile
+obj-m += drivers/scsi/
 LINUXINCLUDE := -I$M/include $(LINUXINCLUDE)
 
 else

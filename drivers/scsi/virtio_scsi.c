@@ -48,6 +48,8 @@ struct virtio_scsi_vq {
 	spinlock_t vq_lock;
 
 	struct virtqueue *vq;
+
+	atomic_t reqs;
 };
 
 /* Per-target queue state */
@@ -56,6 +58,9 @@ struct virtio_scsi_target_state {
 	spinlock_t tgt_lock;
 
 	int req_vq;
+
+	atomic_t reqs;
+	atomic_t last_req_time;
 
 	/* For sglist construction when adding commands to the virtqueue.  */
 	struct scatterlist sg[];
@@ -103,11 +108,15 @@ static void virtscsi_complete_cmd(void *buf)
 {
 	struct virtio_scsi_cmd *cmd = buf;
 	struct scsi_cmnd *sc = cmd->sc;
+	struct virtio_scsi *vscsi = shost_priv(sc->device->host);
+	struct virtio_scsi_target_state *tgt = vscsi->tgt[sc->device->id];
 	struct virtio_scsi_cmd_resp *resp = &cmd->resp.cmd;
 
 	dev_dbg(&sc->device->sdev_gendev,
 		"cmd %p response %u status %#02x sense_len %u\n",
 		sc, resp->response, resp->status, resp->sense_len);
+
+	atomic_dec(&tgt->reqs);
 
 	sc->result = resp->status;
 	virtscsi_compute_resid(sc, resp->resid);
@@ -171,8 +180,10 @@ static void virtscsi_vq_done(struct virtqueue *vq, void (*fn)(void *buf))
 
 	do {
 		virtqueue_disable_cb(vq);
-		while ((buf = virtqueue_get_buf(vq, &len)) != NULL)
+		while ((buf = virtqueue_get_buf(vq, &len)) != NULL) {
+			atomic_dec(&virtscsi_vq->reqs);
 			fn(buf);
+		}
 	} while (!virtqueue_enable_cb(vq));
 
 	spin_unlock_irqrestore(&virtscsi_vq->vq_lock, flags);
@@ -271,8 +282,10 @@ static int virtscsi_kick_cmd(struct virtio_scsi_target_state *tgt,
 	spin_lock(&vq->vq_lock);
 	ret = virtqueue_add_buf(vq->vq, tgt->sg, out_num, in_num, cmd, gfp);
 	spin_unlock(&tgt->tgt_lock);
-	if (ret >= 0)
+	if (ret >= 0) {
+		atomic_inc(&vq->reqs);
 		ret = virtqueue_kick_prepare(vq->vq);
+	}
 
 	spin_unlock_irqrestore(&vq->vq_lock, flags);
 
@@ -287,6 +300,7 @@ static int virtscsi_queuecommand(struct Scsi_Host *sh, struct scsi_cmnd *sc)
 	struct virtio_scsi_target_state *tgt = vscsi->tgt[sc->device->id];
 	struct virtio_scsi_vq *vq;
 	struct virtio_scsi_cmd *cmd;
+	u32 time, last_time;
 	int ret;
 
 	struct Scsi_Host *shost = virtio_scsi_host(vscsi->vdev);
@@ -318,6 +332,9 @@ static int virtscsi_queuecommand(struct Scsi_Host *sh, struct scsi_cmnd *sc)
 
 	BUG_ON(sc->cmd_len > VIRTIO_SCSI_CDB_SIZE);
 	memcpy(cmd->req.cmd.cdb, sc->cmnd, sc->cmd_len);
+
+	time = (u32)jiffies;
+	last_time = atomic_xchg(&tgt->last_req_time, time);
 
 	vq = vscsi->req_vqs[tgt->req_vq];
 	if (virtscsi_kick_cmd(tgt, vq, cmd,
@@ -435,6 +452,7 @@ static void virtscsi_init_vq(struct virtio_scsi_vq *virtscsi_vq,
 	spin_lock_init(&virtscsi_vq->vq_lock);
 	virtscsi_vq->vq = vq;
 	vq->vdev_priv = virtscsi_vq;
+	atomic_set(&virtscsi_vq->reqs, 0);
 }
 
 static struct virtio_scsi_target_state *virtscsi_alloc_tgt(
@@ -452,6 +470,7 @@ static struct virtio_scsi_target_state *virtscsi_alloc_tgt(
 
 	spin_lock_init(&tgt->tgt_lock);
 	sg_init_table(tgt->sg, sg_elems + 2);
+	atomic_set(&tgt->reqs, 0);
 	return tgt;
 }
 

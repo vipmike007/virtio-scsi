@@ -100,7 +100,7 @@ static void virtscsi_complete_cmd(void *buf)
 	case VIRTIO_SCSI_S_OK:
 		set_host_byte(sc, DID_OK);
 		break;
-	case VIRTIO_SCSI_S_UNDERRUN:
+	case VIRTIO_SCSI_S_OVERRUN:
 		set_host_byte(sc, DID_ERROR);
 		break;
 	case VIRTIO_SCSI_S_ABORTED:
@@ -251,7 +251,7 @@ static void virtscsi_map_cmd(struct virtio_scsi *vscsi,
 
 static int virtscsi_kick_cmd(struct virtio_scsi *vscsi, struct virtqueue *vq,
 			     struct virtio_scsi_cmd *cmd,
-			     size_t req_size, size_t resp_size)
+			     size_t req_size, size_t resp_size, gfp_t gfp)
 {
 	unsigned int out_num, in_num;
 	unsigned long flags;
@@ -261,7 +261,7 @@ static int virtscsi_kick_cmd(struct virtio_scsi *vscsi, struct virtqueue *vq,
 
 	virtscsi_map_cmd(vscsi, cmd, &out_num, &in_num, req_size, resp_size);
 
-	ret = virtqueue_add_buf(vq, vscsi->sg, out_num, in_num, cmd);
+	ret = virtqueue_add_buf(vq, vscsi->sg, out_num, in_num, cmd, gfp);
 	if (ret >= 0)
 		virtqueue_kick(vq);
 
@@ -300,7 +300,8 @@ static int virtscsi_queuecommand(struct Scsi_Host *sh, struct scsi_cmnd *sc)
 	memcpy(cmd->req.cmd.cdb, sc->cmnd, sc->cmd_len);
 
 	if (virtscsi_kick_cmd(vscsi, vscsi->req_vq, cmd,
-			      sizeof cmd->req.cmd, sizeof cmd->resp.cmd) >= 0)
+			      sizeof cmd->req.cmd, sizeof cmd->resp.cmd,
+			      GFP_ATOMIC) >= 0)
 		ret = 0;
 
 out:
@@ -314,7 +315,8 @@ static int virtscsi_tmf(struct virtio_scsi *vscsi, struct virtio_scsi_cmd *cmd)
 
 	cmd->comp = &comp;
 	ret = virtscsi_kick_cmd(vscsi, vscsi->ctrl_vq, cmd,
-				sizeof cmd->req.tmf, sizeof cmd->resp.tmf);
+			       sizeof cmd->req.tmf, sizeof cmd->resp.tmf,
+			       GFP_NOIO);
 	if (ret < 0)
 		return FAILED;
 
@@ -551,6 +553,7 @@ static int __init init(void)
 		goto error;
 	}
 
+
 	virtscsi_cmd_pool =
 		mempool_create_slab_pool(VIRTIO_SCSI_MEMPOOL_SZ,
 					 virtscsi_cmd_cache);
@@ -559,7 +562,6 @@ static int __init init(void)
 				"virtscsi_cmd_pool failed\n");
 		goto error;
 	}
-
 	ret = register_virtio_driver(&virtio_scsi_driver);
 	if (ret < 0)
 		goto error;
@@ -575,7 +577,7 @@ error:
 		kmem_cache_destroy(virtscsi_cmd_cache);
 		virtscsi_cmd_cache = NULL;
 	}
-	return -ENOMEM;
+	return ret;
 }
 
 static void __exit fini(void)

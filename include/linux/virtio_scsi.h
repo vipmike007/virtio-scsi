@@ -71,7 +71,7 @@ struct virtio_scsi_config {
 
 /* Response codes */
 #define VIRTIO_SCSI_S_OK                       0
-#define VIRTIO_SCSI_S_UNDERRUN                 1
+#define VIRTIO_SCSI_S_OVERRUN                  1
 #define VIRTIO_SCSI_S_ABORTED                  2
 #define VIRTIO_SCSI_S_BAD_TARGET               3
 #define VIRTIO_SCSI_S_RESET                    4

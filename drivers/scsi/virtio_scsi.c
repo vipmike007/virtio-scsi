@@ -20,6 +20,7 @@
 #include <linux/virtio_ids.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_scsi.h>
+#include <asm-generic/atomic-long.h>
 #include <scsi/scsi_host.h>
 #include <scsi/scsi_device.h>
 #include <scsi/scsi_cmnd.h>
@@ -57,8 +58,7 @@ struct virtio_scsi_target_state {
 	/* Protects sg.  Lock hierarchy is tgt_lock -> vq_lock.  */
 	spinlock_t tgt_lock;
 
-	int req_vq;
-
+	atomic_t req_vq;
 	atomic_t reqs;
 	atomic_t last_req_time;
 
@@ -69,6 +69,9 @@ struct virtio_scsi_target_state {
 /* Driver instance state */
 struct virtio_scsi {
 	struct virtio_device *vdev;
+
+	u32 num_queues;
+	atomic_long_t free_req_vqs;
 
 	struct virtio_scsi_vq ctrl_vq;
 	struct virtio_scsi_vq event_vq;
@@ -83,6 +86,52 @@ static mempool_t *virtscsi_cmd_pool;
 static inline struct Scsi_Host *virtio_scsi_host(struct virtio_device *vdev)
 {
 	return vdev->priv;
+}
+
+/* Atomically clear the lowest set bit in var, return the order of that bit.  */
+static inline int __virtscsi_get_free_req_vq(atomic_long_t *var)
+{
+	long value, bit;
+	do {
+		value = atomic_long_read(var);
+		if (value == 0)
+			return -1;
+	} while (atomic_long_cmpxchg(var, value, value & (value - 1)) != value);
+	bit = value & -value;
+	return fls_long(bit);
+}
+
+/* Atomically set the bit-th bit in var.  */
+static inline void __virtscsi_put_req_vq(atomic_long_t *var, int bit)
+{
+	long mask = 1L << bit;
+	long value;
+
+	/* There is no atomic_long_or!  */
+	value = atomic_long_read(var);
+	do
+		value = atomic_long_cmpxchg(var, value, value | mask);
+	while ((value & mask) != mask);
+}
+
+/* Get a free virtqueue from vscsi and use it for tgt.  */
+static inline int virtscsi_get_free_req_vq(
+	struct virtio_scsi *vscsi, struct virtio_scsi_target_state *tgt)
+{
+	int bit = __virtscsi_get_free_req_vq(&vscsi->free_req_vqs);
+	if (bit == -1)
+		bit = atomic_read(&tgt->req_vq);
+	else
+		atomic_set(&tgt->req_vq, bit);
+
+	return bit;
+}
+
+/* Add back vq to the pool of free virtqueues in vscsi.  */
+static inline void virtscsi_put_req_vq(
+	struct virtio_scsi *vscsi, struct virtio_scsi_vq *vq)
+{
+	__virtscsi_put_req_vq(&vscsi->free_req_vqs, vq - &vscsi->req_vqs[0]);
 }
 
 static void virtscsi_compute_resid(struct scsi_cmnd *sc, u32 resid)
@@ -171,6 +220,8 @@ static void virtscsi_complete_cmd(void *buf)
 
 static void virtscsi_vq_done(struct virtqueue *vq, void (*fn)(void *buf))
 {
+	struct Scsi_Host *sh = virtio_scsi_host(vq->vdev);
+	struct virtio_scsi *vscsi = shost_priv(sh);
 	struct virtio_scsi_vq *virtscsi_vq = vq->vdev_priv;
 	void *buf;
 	unsigned long flags;
@@ -181,7 +232,8 @@ static void virtscsi_vq_done(struct virtqueue *vq, void (*fn)(void *buf))
 	do {
 		virtqueue_disable_cb(vq);
 		while ((buf = virtqueue_get_buf(vq, &len)) != NULL) {
-			atomic_dec(&virtscsi_vq->reqs);
+			if (atomic_dec_return(&virtscsi_vq->reqs) == 0)
+				virtscsi_put_req_vq(vscsi, virtscsi_vq);
 			fn(buf);
 		}
 	} while (!virtqueue_enable_cb(vq));
@@ -301,6 +353,8 @@ static int virtscsi_queuecommand(struct Scsi_Host *sh, struct scsi_cmnd *sc)
 	struct virtio_scsi_vq *vq;
 	struct virtio_scsi_cmd *cmd;
 	u32 time, last_time;
+	int vq_num;
+	int our_vq_reqs;
 	int ret;
 
 	struct Scsi_Host *shost = virtio_scsi_host(vscsi->vdev);
@@ -333,10 +387,23 @@ static int virtscsi_queuecommand(struct Scsi_Host *sh, struct scsi_cmnd *sc)
 	BUG_ON(sc->cmd_len > VIRTIO_SCSI_CDB_SIZE);
 	memcpy(cmd->req.cmd.cdb, sc->cmnd, sc->cmd_len);
 
+	/* This request is not yet on the vq, so do not count it.  */
+	our_vq_reqs = atomic_inc_return(&tgt->reqs) - 1;
 	time = (u32)jiffies;
 	last_time = atomic_xchg(&tgt->last_req_time, time);
 
-	vq = vscsi->req_vqs[tgt->req_vq];
+	/* If the vq is contended with other targets, and we have been
+	 * quiescent for a while, find another vq.
+	 */
+	vq_num = atomic_read(&tgt->req_vq);
+	vq = vscsi->req_vqs[vq_num];
+	if (our_vq_reqs == 0 &&
+	    (time - last_time) >= HZ &&
+	    atomic_read(&vq->reqs) > our_vq_reqs) {
+		vq_num = virtscsi_get_free_req_vq(vscsi, tgt);
+		vq = vscsi->req_vqs[vq_num];
+	}
+
 	if (virtscsi_kick_cmd(tgt, vq, cmd,
 			      sizeof cmd->req.cmd, sizeof cmd->resp.cmd,
 			      GFP_ATOMIC) >= 0)
@@ -503,7 +570,7 @@ static int virtscsi_init(struct virtio_device *vdev,
 	const char **names;
 	struct virtqueue **vqs;
 
-	num_queues = virtscsi_config_get(vdev, num_queues) ?: 1;
+	num_queues = vscsi->num_queues;
 	vqs = kmalloc(num_queues * sizeof(struct virtqueue *), GFP_KERNEL);
 	callbacks = kmalloc(num_queues * sizeof(vq_callback_t *), GFP_KERNEL);
 	names = kmalloc(num_queues * sizeof(char *), GFP_KERNEL);
@@ -546,7 +613,7 @@ static int virtscsi_init(struct virtio_device *vdev,
 			err = -ENOMEM;
 			goto out;
 		}
-		vscsi->tgt[i]->req_vq = i % num_queues;
+		atomic_set(&vscsi->tgt[i]->req_vq, i % num_queues);
 	}
 	err = 0;
 
@@ -584,6 +651,16 @@ static int __devinit virtscsi_probe(struct virtio_device *vdev)
 	vdev->priv = shost;
 
 	num_queues = virtscsi_config_get(vdev, num_queues) ?: 1;
+	num_queues = min_t(u32, num_queues, BITS_PER_LONG);
+
+	/* The mask is computed this way so that it works even if
+	 * num_queues == BITS_PER_LONG.
+	 */
+	atomic_long_set(&vscsi->free_req_vqs,
+			~0UL << (BITS_PER_LONG - num_queues)
+			     >> (BITS_PER_LONG - num_queues));
+
+	vscsi->num_queues = num_queues;
 	vscsi->req_vqs = kzalloc(num_queues * sizeof(vscsi->req_vqs[0]));
 
 	err = virtscsi_init(vdev, vscsi, num_targets);

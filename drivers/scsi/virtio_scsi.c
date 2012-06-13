@@ -25,6 +25,8 @@
 #include <scsi/scsi_cmnd.h>
 
 #define VIRTIO_SCSI_MEMPOOL_SZ 64
+#define virtqueue_kick_prepare virtqueue_kick
+#define virtqueue_notify(x)
 
 /* Command queue element */
 struct virtio_scsi_cmd {
@@ -251,7 +253,7 @@ static void virtscsi_map_cmd(struct virtio_scsi *vscsi,
 
 static int virtscsi_kick_cmd(struct virtio_scsi *vscsi, struct virtqueue *vq,
 			     struct virtio_scsi_cmd *cmd,
-			     size_t req_size, size_t resp_size, gfp_t gfp)
+			     size_t req_size, size_t resp_size)
 {
 	unsigned int out_num, in_num;
 	unsigned long flags;
@@ -261,7 +263,7 @@ static int virtscsi_kick_cmd(struct virtio_scsi *vscsi, struct virtqueue *vq,
 
 	virtscsi_map_cmd(vscsi, cmd, &out_num, &in_num, req_size, resp_size);
 
-	ret = virtqueue_add_buf(vq, vscsi->sg, out_num, in_num, cmd, gfp);
+	ret = virtqueue_add_buf(vq, vscsi->sg, out_num, in_num, cmd);
 	if (ret >= 0)
 		virtqueue_kick(vq);
 
@@ -300,8 +302,7 @@ static int virtscsi_queuecommand(struct Scsi_Host *sh, struct scsi_cmnd *sc)
 	memcpy(cmd->req.cmd.cdb, sc->cmnd, sc->cmd_len);
 
 	if (virtscsi_kick_cmd(vscsi, vscsi->req_vq, cmd,
-			      sizeof cmd->req.cmd, sizeof cmd->resp.cmd,
-			      GFP_ATOMIC) >= 0)
+			      sizeof cmd->req.cmd, sizeof cmd->resp.cmd) >= 0)
 		ret = 0;
 
 out:
@@ -315,8 +316,7 @@ static int virtscsi_tmf(struct virtio_scsi *vscsi, struct virtio_scsi_cmd *cmd)
 
 	cmd->comp = &comp;
 	ret = virtscsi_kick_cmd(vscsi, vscsi->ctrl_vq, cmd,
-			       sizeof cmd->req.tmf, sizeof cmd->resp.tmf,
-			       GFP_NOIO);
+				sizeof cmd->req.tmf, sizeof cmd->resp.tmf);
 	if (ret < 0)
 		return FAILED;
 
@@ -509,22 +509,6 @@ static void __devexit virtscsi_remove(struct virtio_device *vdev)
 	scsi_host_put(shost);
 }
 
-#ifdef CONFIG_PM
-static int virtscsi_freeze(struct virtio_device *vdev)
-{
-	virtscsi_remove_vqs(vdev);
-	return 0;
-}
-
-static int virtscsi_restore(struct virtio_device *vdev)
-{
-	struct Scsi_Host *sh = virtio_scsi_host(vdev);
-	struct virtio_scsi *vscsi = shost_priv(sh);
-
-	return virtscsi_init(vdev, vscsi);
-}
-#endif
-
 static struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_SCSI, VIRTIO_DEV_ANY_ID },
 	{ 0 },
@@ -535,10 +519,6 @@ static struct virtio_driver virtio_scsi_driver = {
 	.driver.owner = THIS_MODULE,
 	.id_table = id_table,
 	.probe = virtscsi_probe,
-#ifdef CONFIG_PM
-	.freeze = virtscsi_freeze,
-	.restore = virtscsi_restore,
-#endif
 	.remove = __devexit_p(virtscsi_remove),
 };
 
@@ -553,7 +533,6 @@ static int __init init(void)
 		goto error;
 	}
 
-
 	virtscsi_cmd_pool =
 		mempool_create_slab_pool(VIRTIO_SCSI_MEMPOOL_SZ,
 					 virtscsi_cmd_cache);
@@ -562,6 +541,7 @@ static int __init init(void)
 				"virtscsi_cmd_pool failed\n");
 		goto error;
 	}
+
 	ret = register_virtio_driver(&virtio_scsi_driver);
 	if (ret < 0)
 		goto error;
@@ -577,7 +557,7 @@ error:
 		kmem_cache_destroy(virtscsi_cmd_cache);
 		virtscsi_cmd_cache = NULL;
 	}
-	return ret;
+	return -ENOMEM;
 }
 
 static void __exit fini(void)

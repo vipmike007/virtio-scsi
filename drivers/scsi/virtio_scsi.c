@@ -160,25 +160,25 @@ static void virtscsi_complete_cmd(void *buf)
 
 static void virtscsi_vq_done(struct virtqueue *vq, void (*fn)(void *buf))
 {
+	struct virtio_scsi_vq *virtscsi_vq = vq->vdev_priv;
 	void *buf;
+	unsigned long flags;
 	unsigned int len;
+
+	spin_lock_irqsave(&virtscsi_vq->vq_lock, flags);
 
 	do {
 		virtqueue_disable_cb(vq);
 		while ((buf = virtqueue_get_buf(vq, &len)) != NULL)
 			fn(buf);
 	} while (!virtqueue_enable_cb(vq));
+
+	spin_unlock_irqrestore(&virtscsi_vq->vq_lock, flags);
 }
 
 static void virtscsi_req_done(struct virtqueue *vq)
 {
-	struct Scsi_Host *sh = virtio_scsi_host(vq->vdev);
-	struct virtio_scsi *vscsi = shost_priv(sh);
-	unsigned long flags;
-
-	spin_lock_irqsave(&vscsi->req_vq.vq_lock, flags);
 	virtscsi_vq_done(vq, virtscsi_complete_cmd);
-	spin_unlock_irqrestore(&vscsi->req_vq.vq_lock, flags);
 };
 
 static void virtscsi_complete_free(void *buf)
@@ -193,24 +193,12 @@ static void virtscsi_complete_free(void *buf)
 
 static void virtscsi_ctrl_done(struct virtqueue *vq)
 {
-	struct Scsi_Host *sh = virtio_scsi_host(vq->vdev);
-	struct virtio_scsi *vscsi = shost_priv(sh);
-	unsigned long flags;
-
-	spin_lock_irqsave(&vscsi->ctrl_vq.vq_lock, flags);
 	virtscsi_vq_done(vq, virtscsi_complete_free);
-	spin_unlock_irqrestore(&vscsi->ctrl_vq.vq_lock, flags);
 };
 
 static void virtscsi_event_done(struct virtqueue *vq)
 {
-	struct Scsi_Host *sh = virtio_scsi_host(vq->vdev);
-	struct virtio_scsi *vscsi = shost_priv(sh);
-	unsigned long flags;
-
-	spin_lock_irqsave(&vscsi->event_vq.vq_lock, flags);
 	virtscsi_vq_done(vq, virtscsi_complete_free);
-	spin_unlock_irqrestore(&vscsi->event_vq.vq_lock, flags);
 };
 
 static void virtscsi_map_sgl(struct scatterlist *sg, unsigned int *p_idx,
@@ -442,6 +430,7 @@ static void virtscsi_init_vq(struct virtio_scsi_vq *virtscsi_vq,
 {
 	spin_lock_init(&virtscsi_vq->vq_lock);
 	virtscsi_vq->vq = vq;
+	vq->vdev_priv = virtscsi_vq;
 }
 
 static struct virtio_scsi_target_state *virtscsi_alloc_tgt(

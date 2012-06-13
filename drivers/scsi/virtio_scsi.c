@@ -25,7 +25,7 @@
 #include <scsi/scsi_cmnd.h>
 
 #define VIRTIO_SCSI_MEMPOOL_SZ 64
-#define virtqueue_kick_prepare virtqueue_kick
+#define virtqueue_kick_prepare(x) (virtqueue_kick(x), 0)
 #define virtqueue_notify(x)
 
 /* Command queue element */
